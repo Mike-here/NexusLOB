@@ -77,8 +77,10 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, request_stop);
     std::signal(SIGTERM, request_stop);
 
-    nexuslob::IngressRing ingress;
-    nexuslob::EgressRing egress;
+    // These queues reserve roughly 116 MiB. Static storage keeps their payloads
+    // out of the default ~8 MiB process stack while preserving startup-only allocation.
+    static nexuslob::IngressRing ingress;
+    static nexuslob::EgressRing egress;
     std::atomic<bool> running{true};
     nexuslob::OrderBook book(nexuslob::OrderBookConfig{});
     nexuslob::NetworkListener listener(ingress, egress, running, port);
