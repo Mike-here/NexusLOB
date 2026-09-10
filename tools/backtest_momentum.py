@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive NexusLOB's fixed binary TCP protocol and validate a momentum replay."""
+"""Replay a dynamically quoted momentum strategy through NexusLOB's binary TCP API."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ import numpy as np
 
 MAGIC = 0x4E4C4F42  # NLOB
 NEW_ORDER = 1
+CANCEL_ORDER = 2
 BUY = 0
 SELL = 1
 LIMIT_GTC = 1
@@ -19,6 +20,9 @@ MARKET = 3
 
 ORDER = struct.Struct("!IBBBBQIIQ")
 EXECUTION = struct.Struct("!IBBHQQQII")
+QUOTE_QUANTITY = 128
+ORDER_ID_STRIDE = 16_000
+ORDER_ID_NAMESPACES = 250
 
 
 @dataclass(frozen=True)
@@ -28,6 +32,7 @@ class ExpectedFill:
 
 
 def order_frame(
+    message_type: int,
     order_id: int,
     side: int,
     order_type: int,
@@ -35,7 +40,7 @@ def order_frame(
     quantity: int,
     sequence: int,
 ) -> bytes:
-    return ORDER.pack(MAGIC, NEW_ORDER, side, order_type, 0, order_id, price_tick, quantity, sequence)
+    return ORDER.pack(MAGIC, message_type, side, order_type, 0, order_id, price_tick, quantity, sequence)
 
 
 def receive_exact(connection: socket.socket, byte_count: int) -> bytes:
@@ -50,15 +55,21 @@ def receive_exact(connection: socket.socket, byte_count: int) -> bytes:
     return b"".join(chunks)
 
 
-def momentum_sides(sample_count: int, rng: np.random.Generator) -> np.ndarray:
-    """Synthetic mid-price path with a short/long rolling-return momentum signal."""
-    innovations = rng.normal(loc=0.015, scale=0.85, size=sample_count + 32)
-    mid = 10_000.0 + np.cumsum(innovations)
-    returns = np.diff(mid)
+def make_momentum_path(sample_count: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+    """Return executable midpoints and lagged fast-minus-slow momentum signals.
+
+    Each signal uses returns observed before its quote midpoint, preventing a
+    same-tick look-ahead bias in the toy strategy.
+    """
+    innovations = rng.normal(loc=0.03, scale=0.80, size=sample_count + 21)
+    midpoints = 10_000.0 + np.cumsum(innovations)
+    returns = np.diff(midpoints)
     fast = np.convolve(returns, np.ones(5) / 5.0, mode="valid")
     slow = np.convolve(returns, np.ones(20) / 20.0, mode="valid")
-    score = fast[-sample_count:] - slow[-sample_count:]
-    return np.where(score >= 0.0, BUY, SELL).astype(np.uint8)
+    score = fast[15 : 15 + sample_count] - slow[:sample_count]
+    sides = np.where(score >= 0.0, BUY, SELL).astype(np.uint8)
+    quote_midpoints = np.rint(midpoints[20 : 20 + sample_count]).astype(np.int64)
+    return quote_midpoints, sides
 
 
 def main() -> None:
@@ -68,32 +79,40 @@ def main() -> None:
     parser.add_argument("--signals", type=int, default=5_000)
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
+    if not 1 <= args.signals <= (ORDER_ID_STRIDE - 1) // 3:
+        parser.error(f"--signals must be in [1, ${(ORDER_ID_STRIDE - 1) // 3}]")
 
     rng = np.random.default_rng(args.seed)
-    levels_per_side = 2_048
-    resting_quantity = 200
-    base_ask = 10_000
-    base_bid = 9_999
+    midpoint_ticks, sides = make_momentum_path(args.signals, rng)
+    quantities = rng.integers(1, 101, size=args.signals)
+
+    # A seed-specific order-ID namespace avoids collisions with a prior replay
+    # once its cancel messages have drained through the matching engine.
+    order_id = 1 + (args.seed % ORDER_ID_NAMESPACES) * ORDER_ID_STRIDE
     sequence = 1
-    order_id = 1
     frames: list[bytes] = []
-
-    # Seed deep two-sided liquidity. GTC additions should not produce reports.
-    for offset in range(levels_per_side):
-        frames.append(order_frame(order_id, SELL, LIMIT_GTC, base_ask + offset, resting_quantity, sequence))
-        order_id += 1
-        sequence += 1
-        frames.append(order_frame(order_id, BUY, LIMIT_GTC, base_bid - offset, resting_quantity, sequence))
-        order_id += 1
-        sequence += 1
-
     expected: dict[int, ExpectedFill] = {}
-    sides = momentum_sides(args.signals, rng)
-    quantities = rng.integers(1, 101, size=args.signals, endpoint=False)
-    for side, quantity in zip(sides.tolist(), quantities.tolist(), strict=True):
-        frames.append(order_frame(order_id, side, MARKET, 0, quantity, sequence))
-        expected[order_id] = ExpectedFill(side=side, quantity=quantity)
-        order_id += 1
+
+    for midpoint, side, quantity in zip(midpoint_ticks.tolist(), sides.tolist(), quantities.tolist(), strict=True):
+        bid_tick = max(1, int(midpoint) - 1)
+        ask_tick = bid_tick + 2
+        bid_id = order_id
+        ask_id = order_id + 1
+        market_id = order_id + 2
+        order_id += 3
+
+        # Quotes are replenished each event, then both residual quotes are
+        # cancelled. This supplies controlled depth around the evolving mid.
+        frames.append(order_frame(NEW_ORDER, bid_id, BUY, LIMIT_GTC, bid_tick, QUOTE_QUANTITY, sequence))
+        sequence += 1
+        frames.append(order_frame(NEW_ORDER, ask_id, SELL, LIMIT_GTC, ask_tick, QUOTE_QUANTITY, sequence))
+        sequence += 1
+        frames.append(order_frame(NEW_ORDER, market_id, side, MARKET, 0, quantity, sequence))
+        sequence += 1
+        expected[market_id] = ExpectedFill(side=side, quantity=quantity)
+        frames.append(order_frame(CANCEL_ORDER, bid_id, BUY, LIMIT_GTC, 0, 0, sequence))
+        sequence += 1
+        frames.append(order_frame(CANCEL_ORDER, ask_id, SELL, LIMIT_GTC, 0, 0, sequence))
         sequence += 1
 
     with socket.create_connection((args.host, args.port), timeout=10.0) as connection:
@@ -103,20 +122,26 @@ def main() -> None:
         cash_ticks = 0
         inventory = 0
         observed_quantity = 0
-        remaining_by_aggressor = {order_id: fill.quantity for order_id, fill in expected.items()}
-        last_sequence = 0
         expected_quantity = sum(fill.quantity for fill in expected.values())
+        remaining_by_aggressor = {order_id: fill.quantity for order_id, fill in expected.items()}
+        first_execution_sequence: int | None = None
+        last_execution_sequence: int | None = None
+
         while observed_quantity < expected_quantity:
             fields = EXECUTION.unpack(receive_exact(connection, EXECUTION.size))
             magic, message_type, side, _reserved, execution_sequence, aggressor_id, _resting_id, price, quantity = fields
             assert magic == MAGIC and message_type == 0x80, "invalid execution frame"
-            assert execution_sequence == last_sequence + 1, "execution sequence gap"
+            if first_execution_sequence is None:
+                first_execution_sequence = execution_sequence
+            else:
+                assert last_execution_sequence is not None
+                assert execution_sequence == last_execution_sequence + 1, "execution sequence gap"
             assert aggressor_id in expected, "unexpected fill"
             target = expected[aggressor_id]
             assert side == target.side and 0 < quantity <= remaining_by_aggressor[aggressor_id], "incorrect fill"
 
             remaining_by_aggressor[aggressor_id] -= quantity
-            last_sequence = execution_sequence
+            last_execution_sequence = execution_sequence
             observed_quantity += quantity
             if side == BUY:
                 inventory += quantity
@@ -126,13 +151,13 @@ def main() -> None:
                 cash_ticks += price * quantity
 
     assert all(quantity == 0 for quantity in remaining_by_aggressor.values())
-    assert observed_quantity == expected_quantity
-
-    # Mark inventory to the synthetic midpoint; one tick is one cent here.
-    marked_pnl_dollars = (cash_ticks + inventory * 10_000) / 100.0
+    mark_tick = int(midpoint_ticks[-1])
+    marked_pnl_dollars = (cash_ticks + inventory * mark_tick) / 100.0
     print(
         f"validated {args.signals:,} momentum orders / {observed_quantity:,} shares; "
-        f"inventory={inventory:,}; marked P&L=${marked_pnl_dollars:,.2f}"
+        f"execution sequence {first_execution_sequence}-{last_execution_sequence}; "
+        f"final midpoint=${mark_tick / 100.0:,.2f}; inventory={inventory:,}; "
+        f"marked P&L=${marked_pnl_dollars:,.2f}"
     )
 
 
