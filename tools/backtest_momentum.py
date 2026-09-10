@@ -61,14 +61,14 @@ def make_momentum_path(sample_count: int, rng: np.random.Generator) -> tuple[np.
     Each signal uses returns observed before its quote midpoint, preventing a
     same-tick look-ahead bias in the toy strategy.
     """
-    innovations = rng.normal(loc=0.03, scale=0.80, size=sample_count + 21)
+    innovations = rng.normal(loc=0.03, scale=0.80, size=sample_count + 22)
     midpoints = 10_000.0 + np.cumsum(innovations)
     returns = np.diff(midpoints)
     fast = np.convolve(returns, np.ones(5) / 5.0, mode="valid")
     slow = np.convolve(returns, np.ones(20) / 20.0, mode="valid")
     score = fast[15 : 15 + sample_count] - slow[:sample_count]
     sides = np.where(score >= 0.0, BUY, SELL).astype(np.uint8)
-    quote_midpoints = np.rint(midpoints[20 : 20 + sample_count]).astype(np.int64)
+    quote_midpoints = np.rint(midpoints[21 : 21 + sample_count]).astype(np.int64)
     return quote_midpoints, sides
 
 
@@ -80,7 +80,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
     if not 1 <= args.signals <= (ORDER_ID_STRIDE - 1) // 3:
-        parser.error(f"--signals must be in [1, ${(ORDER_ID_STRIDE - 1) // 3}]")
+        parser.error(f"--signals must be in [1, {(ORDER_ID_STRIDE - 1) // 3}]")
 
     rng = np.random.default_rng(args.seed)
     midpoint_ticks, sides = make_momentum_path(args.signals, rng)
